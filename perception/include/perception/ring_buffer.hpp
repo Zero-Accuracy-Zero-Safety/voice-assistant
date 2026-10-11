@@ -57,6 +57,7 @@ public:
        }
 
         head_.store(current_head + len, std::memory_order_release);
+        head_.notify_one();
         return true;
     }
 
@@ -85,11 +86,23 @@ public:
         return Capacity;
     }
 
-    [[nodiscard]] size_t size() const constexpr {
+    [[nodiscard]] size_t size() const noexcept {
         const size_t current_head = head_.load(std::memory_order_relaxed);
         const size_t current_tail = tail_.load(std::memory_order_relaxed);
 
         return current_head - current_tail;
+    }
+
+    [[nodiscard]] size_t get_head() const noexcept {
+        return head_.load(std::memory_order_relaxed);
+    }
+
+    void wait_for_head(size_t expected) const noexcept {
+        head_.wait(expected, std::memory_order_acquire);
+    }
+
+    void notify() noexcept {
+        head_.notify_one();
     }
 };
 
