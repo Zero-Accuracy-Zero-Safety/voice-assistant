@@ -1,74 +1,107 @@
 #pragma once
 
 #include "ring_buffer.hpp"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <cstdlib>
+#include <stop_token>
 #include <thread>
-#include <concepts>
-#include <vector>
+#include <utility>
+#include <type_traits>
 
 namespace perception {
 
-template<size_t Capacity, typename T = uint16_t>
+template<size_t Capacity, typename T>
 class AudioProducer {
 private:
-    detail::AudioRingBuffer<Capacity, T>& ring_buffer_;
+    using Ring = detail::AudioRingBuffer<Capacity, T>;
+    Ring& ring_buffer_;
 
 public:
-    explicit AudioProducer(detail::AudioRingBuffer<Capacity, T>& buffer) noexcept
-        : ring_buffer_(buffer) {}
+    explicit AudioProducer(detail::AudioRingBuffer<Capacity, T>& buffer) noexcept : ring_buffer_(buffer) {
+        if (!ring_buffer_.bind_producer()) [[unlikely]] std::abort();
+    }
+
+    // Absolute singleton    
+    AudioProducer(const AudioProducer&) = delete;
+    AudioProducer& operator=(const AudioProducer&) = delete;
+    AudioProducer(AudioProducer&&) = delete;
+    AudioProducer& operator=(AudioProducer&&) = delete;
+
+    ~AudioProducer() { ring_buffer_.unbind_producer(); }
 
     [[nodiscard]] bool produce(const T* src, size_t len) noexcept {
         return ring_buffer_.write(src, len);
     }
 };
 
-template<size_t Capacity, typename T = uint16_t>
+template<std::size_t Capacity, std::size_t ChunkSize, typename T, typename Handler>
 class AudioConsumer {
+        static_assert(ChunkSize > 0 && ChunkSize <= Capacity, "ChunkSize must be in [1, Capacity]");
+    static_assert(std::is_nothrow_invocable_v<Handler&, std::span<const T, ChunkSize>>,
+                  "Handler must be callable as handler(std::span<const T, ChunkSize>) and be noexcept");
+
 private:
-    detail::AudioRingBuffer<Capacity, T>& ring_buffer_;
-    size_t chunk_size_;
-    std::atomic<bool> running_{false};
-    std::jthread worker_thread_;
+    using Ring = detail::AudioRingBuffer<Capacity, T>;
 
-    void process_loop() {
-        std::vector<T> processing_chunk(chunk_size_);
+    Ring& ring_buffer_;
+    [[no_unique_address]] Handler handler_;
+    std::array<T, ChunkSize> chunk_{};
+    std::jthread worker_;
 
-        while (running_.load(std::memory_order_relaxed)) {
-            if (ring_buffer_.size() >= chunk_size_) {
-                if (ring_buffer_.read(processing_chunk.data(), chunk_size_)) {
-                    // TODO: detector logic
-                }
+    void process_loop(std::stop_token st) noexcept {
+        while (true) {
+            const std::uint32_t seen = ring_buffer_.wake_snapshot();
+
+            if (st.stop_requested()) [[unlikely]] break;
+
+            if (ring_buffer_.read(chunk_)) {
+                handler_(std::span<const T, ChunkSize>(chunk_));
             } else {
-                auto current_head = ring_buffer_.get_head();
-                ring_buffer_.wait_for_head(current_head);
+                ring_buffer_.wait_wake(seen);
             }
         }
     }
 
 public:
-    explicit AudioConsumer(detail::AudioRingBuffer<Capacity, T>& buffer, size_t chunk_size) noexcept
-        : ring_buffer_(buffer), chunk_size_(chunk_size) {}
-
-    [[nodiscard]] bool consume(T* dest) noexcept {
-        if (ring_buffer_.size() < chunk_size_) {
-            return false;
-        }
-        return ring_buffer_.read(dest, chunk_size_);
+    explicit AudioConsumer(Ring& buffer, Handler handler) noexcept(std::is_nothrow_move_constructible_v<Handler>) 
+        : ring_buffer_(buffer), handler_(std::move(handler)) {
+        if (!ring_buffer_.bind_consumer()) [[unlikely]] std::abort();
     }
 
-    [[nodiscard]] constexpr size_t get_chunk_size() const noexcept {
-        return chunk_size_;
+    // Absolute singleton   
+    AudioConsumer(const AudioConsumer&) = delete;
+    AudioConsumer& operator=(const AudioConsumer&) = delete;
+    AudioConsumer(AudioConsumer&&) = delete;
+    AudioConsumer& operator=(AudioConsumer&&) = delete;
+
+    ~AudioConsumer() {
+        stop();
+        ring_buffer_.unbind_consumer();
     }
+
+    [[nodiscard]] static constexpr std::size_t get_chunk_size() noexcept { return ChunkSize; }
 
     void start() {
-        if (running_.load(std::memory_order_relaxed)) return;
-        running_.store(true, std::memory_order_relaxed);
-        worker_thread_ = std::jthread([this]() { process_loop(); });
+        if (worker_.joinable()) return;
+        worker_ = std::jthread([this](std::stop_token st) noexcept { process_loop(st); });
     }
 
     void stop() {
-        running_.store(false, std::memory_order_relaxed);
-        ring_buffer_.notify();
+        if (!worker_.joinable()) return;
+        worker_.request_stop();
+        ring_buffer_.wake();
+        worker_.join();
     }
 };  
+
+template<std::size_t ChunkSize, std::size_t Capacity, typename T, typename Handler>
+[[nodiscard]] auto make_consumer(detail::AudioRingBuffer<Capacity, T>& buffer, Handler&& handler) {
+    return AudioConsumer<Capacity, ChunkSize, T, std::decay_t<Handler>>(
+        buffer, std::forward<Handler>(handler));
+}
 
 } // namespace perception
