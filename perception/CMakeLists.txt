@@ -11,8 +11,23 @@ endif()
 
 add_executable(audio_test
     src/main.cpp
+    src/miniaudio_impl.cpp
 )
 
 find_package(Threads REQUIRED)
-target_link_libraries(audio_test PRIVATE Threads::Threads)
-target_include_directories(audio_test PRIVATE include/perception)
+
+target_include_directories(audio_test PRIVATE include)
+
+target_link_libraries(audio_test PRIVATE 
+    Threads::Threads
+    dl
+    m
+)
+
+target_link_libraries(audio_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS} m)
+
+set_source_files_properties(src/miniaudio_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(audio_test PRIVATE asound)
+endif()
